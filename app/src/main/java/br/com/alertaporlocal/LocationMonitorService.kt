@@ -19,18 +19,46 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 
+/**
+ * Monitoramento adaptativo para reduzir consumo:
+ * - usa o provedor de rede (baixo consumo) para acompanhar a região;
+ * - liga o GPS de alta precisão apenas quando a estimativa fica a até 1,5 km do destino;
+ * - desliga o GPS quando a estimativa confiável indica que está a mais de 2,5 km;
+ * - exige uma posição GPS razoavelmente precisa para disparar o alarme.
+ */
 class LocationMonitorService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var prefs: android.content.SharedPreferences
     private lateinit var locationManager: LocationManager
     private val registeredProviders = mutableSetOf<String>()
+    private var lastGpsLocation: Location? = null
 
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
-            // Não use posições antigas em cache: elas podem pertencer a outro lugar.
             val ageMs = System.currentTimeMillis() - location.time
-            if (ageMs < 0L || ageMs > 60_000L) return
-            evaluateLocation(location)
+            if (ageMs < 0L || ageMs > 120_000L) return
+
+            when (location.provider) {
+                LocationManager.NETWORK_PROVIDER -> {
+                    updateGpsPolicy(location)
+                    // A rede serve para aproximar o telefone do destino, não para disparar
+                    // o alarme dentro de 50 m, pois sua precisão pode ser insuficiente.
+                    if (prefs.getBoolean("inside", false)) {
+                        val target = targetLocation()
+                        if (location.distanceTo(target) > prefs.getInt("radius", 50) + 300f) {
+                            // Uma posição de rede muito distante ajuda a rearmar caso o GPS
+                            // tenha perdido sinal durante a saída do local.
+                            prefs.edit().putBoolean("inside", false).putBoolean("ringing", false).apply()
+                            getSystemService(NotificationManager::class.java).cancel(222)
+                        }
+                    }
+                }
+                LocationManager.GPS_PROVIDER -> {
+                    lastGpsLocation = location
+                    updateGpsPolicy(location)
+                    evaluateGpsLocation(location)
+                }
+            }
         }
 
         override fun onProviderEnabled(provider: String) {
@@ -52,7 +80,7 @@ class LocationMonitorService : Service() {
                 return
             }
             ensureLocationUpdates()
-            handler.postDelayed(this, 15_000L)
+            handler.postDelayed(this, 60_000L)
         }
     }
 
@@ -63,7 +91,7 @@ class LocationMonitorService : Service() {
         createChannel()
         startForeground(101, notification("Monitorando o local configurado"))
         ensureLocationUpdates()
-        handler.postDelayed(updateCheck, 15_000L)
+        handler.postDelayed(updateCheck, 60_000L)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -82,41 +110,109 @@ class LocationMonitorService : Service() {
         }
         if (!hasLocationPermission()) return
 
-        val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
-        for (provider in providers) {
-            if (provider in registeredProviders) continue
-            try {
-                if (locationManager.isProviderEnabled(provider)) {
-                    locationManager.requestLocationUpdates(
-                        provider,
-                        5_000L,
-                        0f,
-                        locationListener,
-                        Looper.getMainLooper()
-                    )
-                    registeredProviders.add(provider)
-                }
-            } catch (e: SecurityException) {
-                Log.w("AlertaPorLocal", "Sem permissão para usar $provider", e)
-            } catch (e: IllegalArgumentException) {
-                Log.w("AlertaPorLocal", "Provedor indisponível: $provider", e)
-            } catch (e: Exception) {
-                Log.e("AlertaPorLocal", "Não foi possível solicitar localização de $provider", e)
+        try {
+            // Provedor de rede: baixa frequência e deslocamento mínimo para poupar bateria.
+            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) &&
+                LocationManager.NETWORK_PROVIDER !in registeredProviders) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER,
+                    60_000L,
+                    100f,
+                    locationListener,
+                    Looper.getMainLooper()
+                )
+                registeredProviders.add(LocationManager.NETWORK_PROVIDER)
             }
+
+            // Se não há provedor de rede, é necessário recorrer ao GPS como alternativa.
+            if (!locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) &&
+                locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                registerGps()
+            } else {
+                // Uma localização de rede recente pode ativar o GPS perto do destino.
+                val networkLast = try {
+                    locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                } catch (_: Exception) { null }
+                if (networkLast != null && isFresh(networkLast, 180_000L)) updateGpsPolicy(networkLast)
+            }
+        } catch (e: SecurityException) {
+            Log.w("AlertaPorLocal", "Permissão de localização ausente", e)
+        } catch (e: Exception) {
+            Log.e("AlertaPorLocal", "Não foi possível configurar a localização", e)
         }
     }
 
-    private fun evaluateLocation(loc: Location) {
+    private fun updateGpsPolicy(location: Location) {
+        val distance = location.distanceTo(targetLocation())
+        if (distance <= 1_500f) {
+            registerGps()
+        } else if (distance >= 2_500f) {
+            unregisterGps()
+        }
+    }
+
+    private fun registerGps() {
+        if (!hasLocationPermission() || LocationManager.GPS_PROVIDER in registeredProviders) return
+        try {
+            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    10_000L,
+                    20f,
+                    locationListener,
+                    Looper.getMainLooper()
+                )
+                registeredProviders.add(LocationManager.GPS_PROVIDER)
+            }
+        } catch (e: SecurityException) {
+            Log.w("AlertaPorLocal", "Sem permissão para GPS", e)
+        } catch (e: Exception) {
+            Log.w("AlertaPorLocal", "Não foi possível ativar o GPS", e)
+        }
+    }
+
+    private fun unregisterGps() {
+        if (LocationManager.GPS_PROVIDER !in registeredProviders) return
+        try {
+            locationManager.removeUpdates(locationListener)
+            registeredProviders.remove(LocationManager.GPS_PROVIDER)
+            // removeUpdates remove todos os provedores desse listener; registra novamente
+            // a rede para que o monitoramento de baixo consumo continue.
+            registeredProviders.remove(LocationManager.NETWORK_PROVIDER)
+            if (hasLocationPermission() && locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER,
+                    60_000L,
+                    100f,
+                    locationListener,
+                    Looper.getMainLooper()
+                )
+                registeredProviders.add(LocationManager.NETWORK_PROVIDER)
+            }
+        } catch (e: Exception) {
+            Log.w("AlertaPorLocal", "Não foi possível reduzir o uso do GPS", e)
+        }
+    }
+
+    private fun targetLocation() = Location("target").apply {
+        latitude = prefs.getFloat("lat", 0f).toDouble()
+        longitude = prefs.getFloat("lon", 0f).toDouble()
+    }
+
+    private fun isFresh(location: Location, maxAgeMs: Long): Boolean {
+        val age = System.currentTimeMillis() - location.time
+        return age in 0..maxAgeMs
+    }
+
+    private fun evaluateGpsLocation(loc: Location) {
         if (!prefs.getBoolean("active", false)) {
             stopSelf()
             return
         }
+        // Evita falsos alertas quando o GPS ainda está muito impreciso.
+        if (loc.hasAccuracy() && loc.accuracy > 100f) return
         try {
-            val target = Location("target").apply {
-                latitude = prefs.getFloat("lat", 0f).toDouble()
-                longitude = prefs.getFloat("lon", 0f).toDouble()
-            }
-            val distance = loc.distanceTo(target)
+            val distance = loc.distanceTo(targetLocation())
             val radius = prefs.getInt("radius", 50).toFloat()
             val inside = distance <= radius
             val wasInside = prefs.getBoolean("inside", false)
@@ -153,7 +249,8 @@ class LocationMonitorService : Service() {
                 }
             }
 
-            // Só rearma quando uma localização nova confirma que saiu do raio.
+            // Rearma ao confirmar que saiu do raio. A rede também rearma se indicar
+            // que o aparelho já está bem longe, por segurança quando o GPS falha.
             if (!inside && wasInside) {
                 prefs.edit().putBoolean("ringing", false).apply()
                 getSystemService(NotificationManager::class.java).cancel(222)
@@ -209,10 +306,7 @@ class LocationMonitorService : Service() {
 
     override fun onDestroy() {
         handler.removeCallbacks(updateCheck)
-        try {
-            locationManager.removeUpdates(locationListener)
-        } catch (_: Exception) {
-        }
+        try { locationManager.removeUpdates(locationListener) } catch (_: Exception) {}
         registeredProviders.clear()
         super.onDestroy()
     }
